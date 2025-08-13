@@ -20,7 +20,7 @@ if GEMINI_API_KEY:
 else:
     GEMINI_MODEL_NAME = ""  # sem chave -> fallback local
 
-app = FastAPI(title="English WhatsApp Bot", version="0.2.2")
+app = FastAPI(title="English WhatsApp Bot", version="0.3.0")
 
 # CORS (liberal no dev; em prod, restrinja)
 app.add_middleware(
@@ -69,6 +69,7 @@ def model_generate_text(prompt: str) -> str:
         text = getattr(resp, "text", "") or ""
         return text.strip() if text else "(sem resposta do modelo)"
     except Exception as e:
+        # devolve algo legível ao usuário
         return f"⚠️ Erro ao consultar o modelo: {str(e)}"
 
 def parse_kv_lines(text: str, keys):
@@ -91,6 +92,44 @@ def strip_greeting_prefix(text: str) -> str:
     # remove saudações iniciais "Olá/Oi/Hello/Hi/Hey" + pontuação/emoji
     pattern = r"(?im)^\s*(?:ol[áa]|oi|hello|hi|hey)\s*[!,.…]*\s*[🙂😊👋🤝👍🤗🥳✨]*\s*-?\s*"
     return re.sub(pattern, "", text, count=1).lstrip()
+
+# --------- Intent detection (barato e rápido) ----------
+PT_QUESTION_WORDS = {
+    "o que", "oq", "qual", "quais", "como", "quando", "onde",
+    "por que", "porque", "por quê", "pra que", "para que",
+    "diferença", "significa", "pode me ajudar", "me explica",
+    "é correto", "está certo", "está errado", "devo usar"
+}
+EN_QUESTION_WORDS = {
+    "what", "which", "how", "when", "where", "why",
+    "difference", "mean", "meaning", "should i", "is it correct",
+    "am i", "can i", "could i", "what's", "whats"
+}
+SMALLTALK_WORDS_PT = {"obrigado", "valeu", "blz", "beleza", "tmj", "ok", "boa", "bom dia", "boa tarde", "boa noite"}
+SMALLTALK_WORDS_EN = {"thanks", "thank you", "ok", "cool", "nice", "morning", "good morning", "good night", "good evening"}
+
+def classify_intent(text: str, lang: str) -> str:
+    t = text.strip().lower()
+    # 1) Pergunta explícita
+    if "?" in t:
+        return "question"
+    # 2) Palavras de pergunta por idioma
+    if lang.startswith("pt"):
+        if any(w in t for w in PT_QUESTION_WORDS):
+            return "question"
+        if any(w in t for w in SMALLTALK_WORDS_PT):
+            return "smalltalk"
+    else:
+        if any(w in t for w in EN_QUESTION_WORDS):
+            return "question"
+        if any(w in t for w in SMALLTALK_WORDS_EN):
+            return "smalltalk"
+    # 3) Heurística simples: frases curtinhas tendem a ser correção
+    words = len(t.split())
+    if words <= 2:
+        return "smalltalk"
+    # 4) Padrão: correção
+    return "correction"
 
 # ------------------ Endpoints básicos ------------------
 @app.get("/")
@@ -248,11 +287,44 @@ async def correct_english(message: Message):
         user_memory.pop(message.phone, None)
         return {"reply": "🔄 Sua memória foi resetada com sucesso! Você pode recomeçar do zero."}
 
-    # ------------------ Correção de frases ------------------
+    # ------------------ INTENT: question / smalltalk / correction ------------------
     lang = safe_detect_lang(user_text_raw)
+    intent = classify_intent(user_text_raw, lang)
 
+    # 1) Pergunta: responde conteúdo (sem corrigir a frase do usuário)
+    if intent == "question":
+        if lang.startswith("pt"):
+            base = (
+                "Você é um professor de inglês. Responda em português (Brasil).\n"
+                "Explique de forma clara e prática o que o aluno perguntou, com exemplos curtos em inglês quando útil.\n"
+                "NÃO cumprimente. NÃO corrija a pergunta do aluno. Foque na explicação do tema.\n"
+                "Se houver termos em inglês, mantenha-os em *itálico*.\n"
+                "No final, sugira 1 frase de exemplo para o aluno praticar (somente 1 linha)."
+            )
+        else:
+            base = (
+                "You are an English teacher. Answer in ENGLISH.\n"
+                "Explain clearly what the student asked, with short examples when useful.\n"
+                "Do NOT greet. Do NOT correct the student's question. Focus on the topic.\n"
+                "Finish with one single practice sentence (one line)."
+            )
+        prompt = f"{base}\n\nStudent question:\n\"{user_text_raw}\"\n\nAnswer:"
+        reply_text = model_generate_text(prompt)
+        reply_text = strip_greeting_prefix(strip_motivacao_label(reply_text))
+        memory.setdefault("history", []).extend([f"Q: {user_text_raw}", f"A: {reply_text}"])
+        return {"reply": reply_text}
+
+    # 2) Smalltalk: resposta curta e simpática
+    if intent == "smalltalk":
+        if lang.startswith("pt"):
+            reply_text = "👍 Bora praticar! Me envie uma frase em inglês para eu corrigir ou faça uma pergunta sobre gramática."
+        else:
+            reply_text = "👍 Let's practice! Send me an English sentence to correct or ask a grammar question."
+        return {"reply": reply_text}
+
+    # 3) Correção (padrão): devolve blocos fixos
     if lang == "en" and user_text_raw.strip().lower().startswith("how"):
-        # Modo "pergunta em inglês" — responde em inglês com 3 blocos
+        # Modo "pergunta em inglês" caiu como correction? garantir blocos em EN
         base = (
             "You are a friendly English teacher. The student's English level is {level}.\n"
             "Answer in ENGLISH only. Do NOT greet. Do NOT translate the student's sentence.\n"
@@ -263,7 +335,6 @@ async def correct_english(message: Message):
             "No extra text before or after the sections."
         )
     else:
-        # Modo padrão — explica em PT-BR com 3 blocos
         base = (
             "Você é um professor amigável de inglês. O aluno está no nível {level}.\n"
             "Responda em PORTUGUÊS (Brasil). NÃO cumprimente. NÃO traduza a frase corrigida para o português.\n"
@@ -271,20 +342,16 @@ async def correct_english(message: Message):
             "*Correção:* <frase corrigida em inglês>\n"
             "*Explicação:* <explicação curta em português sobre a regra aplicada>\n"
             "*Dica:* <uma dica curta em português, finalize com um único emoji>\n"
-            "Não inclua nada além desses blocos; não inclua título, saudação ou 'Motivação'."
+            "Não inclua nada além desses blocos."
         )
 
     prompt = base.format(level=message.level)
-
     history = user_memory.get(message.phone, {}).get("history", [])
     history_text = "\n".join(history[-2:])
     full_prompt = f"{prompt}\n\nStudent: '{user_text_raw}'\nAnswer:"
 
     reply_text = model_generate_text(full_prompt)
-
-    # Limpezas pós-Gemini
-    reply_text = strip_motivacao_label(reply_text)   # remove "Motivação:"/"Motivation:"
-    reply_text = strip_greeting_prefix(reply_text)   # remove "Olá/Hello/Hi..." no começo
+    reply_text = strip_greeting_prefix(strip_motivacao_label(reply_text))
 
     # Atualiza histórico leve
     memory.setdefault("history", []).extend([
