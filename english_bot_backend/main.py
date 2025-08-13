@@ -15,12 +15,12 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
-    # Modelo mais leve para Render Free; altere se quiser "gemini-2.5-flash"
+    # Modelo leve para Render Free
     GEMINI_MODEL_NAME = "gemini-1.5-flash"
 else:
     GEMINI_MODEL_NAME = ""  # sem chave -> fallback local
 
-app = FastAPI(title="English WhatsApp Bot", version="0.2.1")
+app = FastAPI(title="English WhatsApp Bot", version="0.2.2")
 
 # CORS (liberal no dev; em prod, restrinja)
 app.add_middleware(
@@ -63,21 +63,15 @@ def model_generate_text(prompt: str) -> str:
     """
     if not GEMINI_API_KEY or not GEMINI_MODEL_NAME:
         return "⚠️ (modo offline) Não há GEMINI_API_KEY configurada; resposta simulada."
-
     try:
         model = genai.GenerativeModel(GEMINI_MODEL_NAME)
         resp = model.generate_content(prompt)
         text = getattr(resp, "text", "") or ""
         return text.strip() if text else "(sem resposta do modelo)"
     except Exception as e:
-        # Não quebra a API; devolve uma mensagem útil
         return f"⚠️ Erro ao consultar o modelo: {str(e)}"
 
 def parse_kv_lines(text: str, keys):
-    """
-    Procura linhas que começam com chaves como 'QUESTION:', 'ANSWER:', etc.
-    Retorna dict simples {key: value}.
-    """
     data = {k: "" for k in keys}
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     for k in keys:
@@ -89,18 +83,12 @@ def parse_kv_lines(text: str, keys):
     return data
 
 def strip_motivacao_label(text: str) -> str:
-    """
-    Remove rótulos como 'Motivação:'/'Motivation:' (com ou sem asteriscos),
-    preservando apenas a frase motivacional.
-    """
+    # remove "Motivação:" / "Motivation:" (com/sem asteriscos)
     pattern = r"(?im)^\s*\*?\s*motiv[aá]?[cç][aã]o\s*\*?\s*:\s*|^\s*\*?\s*motivation\s*\*?\s*:\s*"
     return re.sub(pattern, "", text)
 
 def strip_greeting_prefix(text: str) -> str:
-    """
-    Remove saudações iniciais como 'Olá', 'Oi', 'Hello', 'Hi', 'Hey'
-    (com pontuação/emoji logo após). Afeta apenas o INÍCIO do texto.
-    """
+    # remove saudações iniciais "Olá/Oi/Hello/Hi/Hey" + pontuação/emoji
     pattern = r"(?im)^\s*(?:ol[áa]|oi|hello|hi|hey)\s*[!,.…]*\s*[🙂😊👋🤝👍🤗🥳✨]*\s*-?\s*"
     return re.sub(pattern, "", text, count=1).lstrip()
 
@@ -128,7 +116,6 @@ async def correct_english(message: Message):
         correct_letter = memory["awaiting_quiz"]["correct"].strip().upper()
         question = memory["awaiting_quiz"]["question"]
         explanation = memory["awaiting_quiz"]["explanation"]
-        # limpa estado
         del memory["awaiting_quiz"]
 
         user_answer = user_text.strip().upper()
@@ -185,8 +172,6 @@ async def correct_english(message: Message):
         )
         quiz_text = model_generate_text(quiz_prompt)
         data = parse_kv_lines(quiz_text, ["QUESTION", "ANSWER", "EXPLANATION"])
-
-        # Captura alternativas
         lines = [l for l in quiz_text.splitlines() if l.strip()]
         choices = "\n".join([l for l in lines if l[:2] in ("A:", "B:", "C:", "D:")])
 
@@ -267,24 +252,33 @@ async def correct_english(message: Message):
     lang = safe_detect_lang(user_text_raw)
 
     if lang == "en" and user_text_raw.strip().lower().startswith("how"):
+        # Modo "pergunta em inglês" — responde em inglês com 3 blocos
         base = (
             "You are a friendly English teacher. The student's English level is {level}.\n"
-            "Correct the student's sentence (if needed) and explain briefly.\n"
-            "Add one motivating emoji at the END.\n"
-            "Do NOT start the answer with greetings like 'Hello', 'Hi', 'Hey' or similar."
+            "Answer in ENGLISH only. Do NOT greet. Do NOT translate the student's sentence.\n"
+            "Return EXACTLY these sections, in this order, each on its own line:\n"
+            "*Correction:* <corrected sentence in English>\n"
+            "*Explanation:* <short explanation in English of the grammar or usage>\n"
+            "*Tip:* <one short tip in English, end with a single emoji>\n"
+            "No extra text before or after the sections."
         )
     else:
+        # Modo padrão — explica em PT-BR com 3 blocos
         base = (
             "Você é um professor amigável de inglês. O aluno está no nível {level}.\n"
-            "Corrija a frase (se necessário) e explique em português com uma dica.\n"
-            "Adicione um emoji motivacional no FINAL da resposta.\n"
-            "NÃO comece com saudações como 'Olá', 'Oi' ou similares."
+            "Responda em PORTUGUÊS (Brasil). NÃO cumprimente. NÃO traduza a frase corrigida para o português.\n"
+            "Devolva EXATAMENTE estes blocos, nesta ordem, cada um em sua própria linha:\n"
+            "*Correção:* <frase corrigida em inglês>\n"
+            "*Explicação:* <explicação curta em português sobre a regra aplicada>\n"
+            "*Dica:* <uma dica curta em português, finalize com um único emoji>\n"
+            "Não inclua nada além desses blocos; não inclua título, saudação ou 'Motivação'."
         )
+
     prompt = base.format(level=message.level)
 
     history = user_memory.get(message.phone, {}).get("history", [])
     history_text = "\n".join(history[-2:])
-    full_prompt = f"{prompt}\n{history_text}\nStudent: '{user_text_raw}'\nAnswer:"
+    full_prompt = f"{prompt}\n\nStudent: '{user_text_raw}'\nAnswer:"
 
     reply_text = model_generate_text(full_prompt)
 
@@ -306,9 +300,8 @@ async def resetar_memoria(req: ResetReq):
     user_memory.pop(req.phone, None)
     return {"status": "ok"}
 
-# Rota opcional p/ integração direta via WhatsApp (Node envia aqui e reenvia resposta ao usuário)
 @app.post("/whatsapp/webhook")
 async def whatsapp_webhook(msg: WhatsAppMessage):
     payload = Message(user_message=msg.body, phone=msg.from_number)
-    result = await correct_english(payload)  # reutiliza lógica do /correct
+    result = await correct_english(payload)
     return {"to": msg.from_number, "reply": result.get("reply", "")}
