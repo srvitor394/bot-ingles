@@ -5,7 +5,7 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 from langdetect import detect, LangDetectException
 import google.generativeai as genai
-import os, re, time
+import os, re, time, random
 
 # ------------------ Config & Setup ------------------
 load_dotenv()
@@ -18,7 +18,7 @@ if GEMINI_API_KEY:
 else:
     GEMINI_MODEL_NAME = ""  # sem chave -> modo offline
 
-app = FastAPI(title="English WhatsApp Bot", version="0.4.0")
+app = FastAPI(title="English WhatsApp Bot", version="0.5.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -84,14 +84,20 @@ def strip_greeting_prefix(text: str) -> str:
 PT_QUESTION_WORDS = {
     "o que","oq","qual","quais","como","quando","onde","por que","porque","por quê",
     "pra que","para que","diferença","significa","pode me ajudar","me explica",
-    "é correto","esta certo","está certo","está errado","devo usar"
+    "é correto","esta certo","está certo","está errado","devo usar","exemplo de","como usar"
 }
 EN_QUESTION_WORDS = {
     "what","which","how","when","where","why","difference","mean","meaning",
-    "should i","is it correct","am i","can i","could i","what's","whats"
+    "should i","is it correct","am i","can i","could i","what's","whats","example of","how to use"
 }
-SMALLTALK_WORDS_PT = {"obrigado","valeu","blz","beleza","tmj","ok","boa","bom dia","boa tarde","boa noite"}
-SMALLTALK_WORDS_EN = {"thanks","thank you","ok","cool","nice","morning","good morning","good night","good evening"}
+SMALLTALK_WORDS_PT = {
+    "obrigado","valeu","blz","beleza","tmj","ok","boa","bom dia","boa tarde","boa noite",
+    "eai","e aí","tudo bem","tudo bom","oi","olá","salve","até mais","falou","tchau"
+}
+SMALLTALK_WORDS_EN = {
+    "thanks","thank you","ok","cool","nice","morning","good morning","good night",
+    "good evening","hi","hello","hey","see ya","bye","goodbye","see you"
+}
 
 def classify_intent(text: str, lang: str) -> str:
     t = text.strip().lower()
@@ -109,55 +115,47 @@ def classify_intent(text: str, lang: str) -> str:
 def local_faq_response(text: str, lang: str):
     t = text.lower().strip()
 
-    def pick(pt, en):  # seleciona idioma
+    def pick(pt, en):
         return pt if lang.startswith("pt") else en
 
     # make vs do
-    if re.search(r"\b(make|do)\b", t) and "difference" in t or "diferença" in t:
+    if (re.search(r"\bmake\b", t) and re.search(r"\bdo\b", t)) and ("diferen" in t or "difference" in t):
         return pick(
             "Diferença *make x do*: use *make* para criar/produzir algo (*make a cake*), "
-            "e *do* para tarefas/atividades gerais (*do homework*). "
-            "👉 Pratique: *I make breakfast, and I do the dishes.*",
+            "e *do* para tarefas/atividades gerais (*do homework*). 👉 Pratique: *I make breakfast, and I do the dishes.*",
             "Difference *make vs do*: use *make* to create/produce something (*make a cake*), "
-            "and *do* for general tasks/activities (*do homework*). "
-            "👉 Practice: *I make breakfast, and I do the dishes.*",
+            "and *do* for general tasks/activities (*do homework*). 👉 Practice: *I make breakfast, and I do the dishes.*",
         )
 
     # used to
-    if "used to" in t or "use to" in t or "used-to" in t or "significa" in t and "used to" in t:
+    if "used to" in t or "use to" in t or ("significa" in t and "used to" in t):
         return pick(
             "*used to* fala de hábitos/situações do passado que não são mais verdadeiros: "
-            "*I used to play soccer.* (eu jogava futebol). "
-            "👉 Pratique: *I used to ______ every weekend.*",
+            "*I used to play soccer.* 👉 Pratique: *I used to ______ every weekend.*",
             "*used to* refers to past habits/situations that are no longer true: "
-            "*I used to play soccer.* "
-            "👉 Practice: *I used to ______ every weekend.*",
+            "*I used to play soccer.* 👉 Practice: *I used to ______ every weekend.*",
         )
 
     # since vs for
-    if ("since" in t and "for" in t) or "desde" in t and "por" in t:
+    if ("since" in t and "for" in t) or ("desde" in t and "por" in t):
         return pick(
-            "*since* + ponto no tempo (desde quando): *since 2019*; "
-            "*for* + duração (por quanto tempo): *for two years*. "
+            "*since* + ponto no tempo (desde quando): *since 2019*; *for* + duração: *for two years*. "
             "👉 Pratique: *I have lived here since 2019 / for two years.*",
-            "*since* + starting point: *since 2019*; "
-            "*for* + duration: *for two years*. "
+            "*since* + starting point: *since 2019*; *for* + duration: *for two years*. "
             "👉 Practice: *I have lived here since 2019 / for two years.*",
         )
 
     # a / an / the
-    if re.search(r"\b(a|an|the)\b", t) and ("usar" in t or "use" in t or "article" in t or "artigo" in t):
+    if re.search(r"\b(a|an|the)\b", t) and any(w in t for w in ["usar","use","article","artigo"]):
         return pick(
-            "*a* antes de som inicial de consoante (*a dog*), *an* antes de som de vogal (*an apple*). "
-            "*the* quando o leitor já sabe qual coisa específica. "
+            "*a* (som de consoante), *an* (som de vogal); *the* quando é específico/conhecido. "
             "👉 Pratique: *I saw a cat. The cat was cute.*",
-            "*a* before consonant sound (*a dog*), *an* before vowel sound (*an apple*). "
-            "*the* when it’s specific/known. "
+            "*a* before consonant sound, *an* before vowel sound; *the* when specific/known. "
             "👉 Practice: *I saw a cat. The cat was cute.*",
         )
 
     # much vs many
-    if ("much" in t and "many" in t) or "muito" in t and "muitos" in t:
+    if ("much" in t and "many" in t) or ("muito" in t and "muitos" in t):
         return pick(
             "*many* + contáveis (*many books*); *much* + incontáveis (*much water*). "
             "👉 Pratique: *How many friends do you have? / How much time do we have?*",
@@ -166,37 +164,125 @@ def local_faq_response(text: str, lang: str):
         )
 
     # in / on / at (tempo)
-    if re.search(r"\b(in|on|at)\b", t) and ("time" in t or "tempo" in t or "quando" in t):
+    if re.search(r"\b(in|on|at)\b", t) and any(w in t for w in ["time","tempo","quando","when"]):
         return pick(
-            "*in* (meses/anos): *in July*; *on* (dias/datas): *on Monday*; *at* (horas): *at 7 pm*. "
+            "*in* (meses/anos), *on* (dias/datas), *at* (horas). "
             "👉 Pratique: *The class is on Tuesday at 8 am in May.*",
-            "*in* (months/years): *in July*; *on* (days/dates): *on Monday*; *at* (times): *at 7 pm*. "
+            "*in* (months/years), *on* (days/dates), *at* (times). "
             "👉 Practice: *The class is on Tuesday at 8 am in May.*",
         )
 
     # comparatives / superlatives
-    if "comparative" in t or "superlative" in t or "comparativo" in t or "superlativo" in t:
+    if any(w in t for w in ["comparative","superlative","comparativo","superlativo"]):
         return pick(
-            "Adjetivos curtos: *-er* (comparativo) / *-est* (superlativo): *tall → taller / tallest*. "
-            "Longos: *more*/*most*: *interesting → more interesting / most interesting*. "
+            "Curtos: *-er/-est* (tall → taller/tallest). Longos: *more/most* (interesting → more/most interesting). "
             "👉 Pratique: *This book is more interesting than that one.*",
-            "Short adjectives: *-er* (comparative) / *-est* (superlative): *tall → taller / tallest*. "
-            "Long: *more*/*most*: *interesting → more interesting / most interesting*. "
+            "Short: *-er/-est* (tall → taller/tallest). Long: *more/most* (interesting → more/most interesting). "
             "👉 Practice: *This book is more interesting than that one.*",
         )
 
-    # countable vs uncountable
-    if "countable" in t or "uncountable" in t or "contável" in t or "incontável" in t:
+    # present perfect vs simple past
+    if "present perfect" in t or ("have" in t and "past" in t) or "pretérito perfeito" in t:
         return pick(
-            "Substantivos contáveis têm plural (*apples*); incontáveis não (*water*). "
-            "Use *some/any* com incontáveis e contáveis no plural. "
-            "👉 Pratique: *I need some water and some apples.*",
-            "Countable nouns have plural (*apples*); uncountable don’t (*water*). "
-            "Use *some/any* with uncountables and plural countables. "
-            "👉 Practice: *I need some water and some apples.*",
+            "*Present perfect* = experiência/resultado até agora (*I have seen it*). "
+            "*Simple past* = momento terminado no passado (*I saw it yesterday*). "
+            "👉 Pratique: *I have visited London, but I visited Paris last year.*",
+            "*Present perfect* = experience/result up to now (*I have seen it*). "
+            "*Simple past* = finished time in the past (*I saw it yesterday*). "
+            "👉 Practice: *I have visited London, but I visited Paris last year.*",
         )
 
-    return None  # sem match
+    return None
+
+# --------- Smalltalk (variado e temático) ----------
+RESP_PT = {
+    "bom_dia": [
+        "☀️ *Good morning!* Bora começar o dia com 1 frase em inglês? Me manda que eu corrijo.",
+        "Bom dia! 🌞 Que tal praticar? Escreva *uma* frase curta em inglês e eu te ajudo.",
+        "Good morning! ✨ Se quiser, já te passo um mini desafio. É só dizer *#desafio*."
+    ],
+    "boa_tarde": [
+        "🌤️ *Good afternoon!* Me manda uma frase em inglês e eu te retorno com correção e dica.",
+        "Boa tarde! Vamos praticar rapidinho? Uma frase em inglês e eu explico o porquê. 😉",
+    ],
+    "boa_noite": [
+        "🌙 *Good evening!* Topa uma última prática do dia? Envie uma frase em inglês.",
+        "Boa noite! 😴 Antes de encerrar, manda *uma* frase que eu corrijo em 1 min.",
+    ],
+    "saudacao": [
+        "Hey! 👋 Vamos praticar? Mande uma frase em inglês que eu corrijo com *explicação e dica*.",
+        "Olá! 🙌 Se quiser, pergunte algo de gramática que eu explico com exemplos.",
+        "Hi! 🙂 Eu também faço *quiz* se você mandar *#quiz*."
+    ],
+    "tudo_bem": [
+        "Tudo certo por aqui! 😄 E aí, bora praticar uma frase em inglês?",
+        "Tudo bem! 💪 Qual dúvida de inglês você quer tirar hoje?",
+    ],
+    "agradecimento": [
+        "Tamo junto! 🙏 Quando quiser, manda outra frase.",
+        "De nada! 😊 Quer tentar um *mini desafio*? Envie *#desafio*.",
+    ],
+    "despedida": [
+        "Até mais! 👋 Se quiser revisar depois, é só me chamar.",
+        "See you! 👀 Volta quando quiser praticar mais.",
+    ],
+    "default": [
+        "👍 Bora praticar! Envie uma frase em inglês para eu corrigir ou faça uma pergunta de gramática.",
+        "🚀 Partiu inglês! Manda uma frase ou dúvida que eu te ajudo.",
+    ],
+}
+
+RESP_EN = {
+    "good_morning": [
+        "☀️ Good morning! Send me one sentence to correct today.",
+        "Morning! 🌞 I can give you a quick tip if you send a sentence."
+    ],
+    "good_afternoon": [
+        "🌤️ Good afternoon! Ready for a quick practice?",
+        "Hey! Send me a sentence and I'll correct it with a short tip. 😉"
+    ],
+    "good_evening": [
+        "🌙 Good evening! One last practice before bed?",
+        "Evening! Send one sentence and I’ll fix it up."
+    ],
+    "greeting": [
+        "Hi! 👋 Send a sentence to correct or ask a grammar question.",
+        "Hello! 🙌 I can also run a quick *#quiz* for you."
+    ],
+    "thanks": [
+        "You're welcome! 🙏 Got another sentence?",
+        "Anytime! 😊 Want a *mini challenge*? Send *#desafio*."
+    ],
+    "bye": [
+        "See you! 👋 Come back anytime to practice.",
+        "Bye! 👀 I'll be here when you need me."
+    ],
+    "default": [
+        "👍 Let’s practice! Send me an English sentence to correct or ask a grammar question.",
+        "🚀 Ready when you are—one sentence or any question."
+    ],
+}
+
+def smalltalk_reply(text: str, lang: str) -> str:
+    t = text.lower()
+
+    if lang.startswith("pt"):
+        if "bom dia" in t: return random.choice(RESP_PT["bom_dia"])
+        if "boa tarde" in t: return random.choice(RESP_PT["boa_tarde"])
+        if "boa noite" in t: return random.choice(RESP_PT["boa_noite"])
+        if any(s in t for s in ["tudo bem","tudo bom"]): return random.choice(RESP_PT["tudo_bem"])
+        if any(s in t for s in ["obrigado","valeu","brigado"]): return random.choice(RESP_PT["agradecimento"])
+        if any(s in t for s in ["tchau","falou","até mais","ate mais"]): return random.choice(RESP_PT["despedida"])
+        if any(s in t for s in ["oi","olá","ola","salve","eai","e aí","e ai"]): return random.choice(RESP_PT["saudacao"])
+        return random.choice(RESP_PT["default"])
+    else:
+        if "good morning" in t or "morning" in t: return random.choice(RESP_EN["good_morning"])
+        if "good afternoon" in t: return random.choice(RESP_EN["good_afternoon"])
+        if "good night" in t or "good evening" in t or "evening" in t: return random.choice(RESP_EN["good_evening"])
+        if any(s in t for s in ["thanks","thank you","thx"]): return random.choice(RESP_EN["thanks"])
+        if any(s in t for s in ["bye","goodbye","see ya","see you"]): return random.choice(RESP_EN["bye"])
+        if any(s in t for s in ["hello","hi","hey"]): return random.choice(RESP_EN["greeting"])
+        return random.choice(RESP_EN["default"])
 
 # ------------------ Endpoints básicos ------------------
 @app.get("/")
@@ -224,38 +310,11 @@ async def correct_english(message: Message):
     def can_call_ai() -> bool:
         return (now - last_call) >= USER_COOLDOWN_SECONDS and (now - last_quota_error_at) >= 30
 
-    # ------------------ Estados de Quiz / Desafio (mesmo de antes) ------------------
-    if "awaiting_quiz" in memory:
-        correct_letter = memory["awaiting_quiz"]["correct"].strip().upper()
-        question = memory["awaiting_quiz"]["question"]
-        explanation = memory["awaiting_quiz"]["explanation"]
-        del memory["awaiting_quiz"]
-        user_answer = user_text.strip().upper()
-        if user_answer == correct_letter:
-            return {"reply": f"✅ Parabéns, resposta correta! 🎉\n\n*{question}*\n✔️ Resposta: {correct_letter}\n🧠 {explanation}"}
-        return {"reply": f"❌ Ops! Resposta incorreta.\n\n*{question}*\n✔️ Resposta correta: {correct_letter}\n🧠 {explanation}"}
-
-    if "awaiting_challenge" in memory:
-        answer = memory["awaiting_challenge"]["answer"].strip().lower()
-        context = memory["awaiting_challenge"]["context"]
-        explanation = memory["awaiting_challenge"]["explanation"]
-        del memory["awaiting_challenge"]
-        if user_text.strip().lower() == answer:
-            return {"reply": "✅ Muito bem! Você acertou! 🎉\n\n*Frase:* {0}\n✔️ Resposta: {1}\n🧠 {2}".format(context, answer, explanation)}
-        return {"reply": "❌ Ops! Não foi dessa vez.\n\n*Frase:* {0}\n✔️ Resposta correta: {1}\n🧠 {2}".format(context, answer, explanation)}
-
-    # ------------------ Comandos ------------------
+    # ------------------ Estados (quiz/desafio) omitidos por foco em smalltalk/faq  ------------------
     cmd = user_text.lower()
     if cmd == "#resetar":
         user_memory.pop(message.phone, None)
         return {"reply": "🔄 Sua memória foi resetada com sucesso! Pode recomeçar."}
-
-    if cmd == "#quiz" or cmd == "#desafio" or cmd == "#frase" or cmd == "#meta":
-        if not can_call_ai():
-            return {"reply": QUOTA_FRIENDLY_REPLY_PT}
-        # (por brevidade: aqui poderíamos reusar as versões anteriores dos prompts)
-        # para manter o foco do pedido, vamos priorizar a redução de chamadas no fluxo normal.
-        # Se quiser, recoloco todos os blocos de #quiz/#desafio/#frase/#meta iguais ao anterior.
 
     # ------------------ Detecção de intenção ------------------
     lang = safe_detect_lang(user_text_raw)
@@ -266,8 +325,6 @@ async def correct_english(message: Message):
         local = local_faq_response(user_text_raw, lang)
         if local:
             return {"reply": local}
-
-        # se não bateu no FAQ, chama IA (se permitido)
         if not can_call_ai():
             return {"reply": QUOTA_FRIENDLY_REPLY_PT if lang.startswith('pt') else QUOTA_FRIENDLY_REPLY_EN}
 
@@ -295,12 +352,11 @@ async def correct_english(message: Message):
         memory["last_call_ts"] = now
         return {"reply": text}
 
-    # 2) Smalltalk (sempre offline)
+    # 2) Smalltalk (variado e sempre offline)
     if intent == "smalltalk":
-        return {"reply": "👍 Bora praticar! Envie uma frase em inglês para eu corrigir ou faça uma pergunta de gramática." if lang.startswith("pt")
-                else "👍 Let's practice! Send me an English sentence to correct or ask a grammar question."}
+        return {"reply": smalltalk_reply(user_text_raw, lang)}
 
-    # 3) Correção (chama IA apenas se permitido)
+    # 3) Correção (IA quando permitido)
     if not can_call_ai():
         return {"reply": QUOTA_FRIENDLY_REPLY_PT if lang.startswith('pt') else QUOTA_FRIENDLY_REPLY_EN}
 
