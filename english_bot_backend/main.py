@@ -7,6 +7,7 @@ from langdetect import detect, LangDetectException
 import google.generativeai as genai
 import os
 import json
+import re
 
 # ------------------ Config & Setup ------------------
 load_dotenv()
@@ -19,7 +20,7 @@ if GEMINI_API_KEY:
 else:
     GEMINI_MODEL_NAME = ""  # sem chave -> fallback local
 
-app = FastAPI(title="English WhatsApp Bot", version="0.2.0")
+app = FastAPI(title="English WhatsApp Bot", version="0.2.1")
 
 # CORS (liberal no dev; em prod, restrinja)
 app.add_middleware(
@@ -86,6 +87,22 @@ def parse_kv_lines(text: str, keys):
                 data[k] = l[len(prefix):].strip()
                 break
     return data
+
+def strip_motivacao_label(text: str) -> str:
+    """
+    Remove rótulos como 'Motivação:'/'Motivation:' (com ou sem asteriscos),
+    preservando apenas a frase motivacional.
+    """
+    pattern = r"(?im)^\s*\*?\s*motiv[aá]?[cç][aã]o\s*\*?\s*:\s*|^\s*\*?\s*motivation\s*\*?\s*:\s*"
+    return re.sub(pattern, "", text)
+
+def strip_greeting_prefix(text: str) -> str:
+    """
+    Remove saudações iniciais como 'Olá', 'Oi', 'Hello', 'Hi', 'Hey'
+    (com pontuação/emoji logo após). Afeta apenas o INÍCIO do texto.
+    """
+    pattern = r"(?im)^\s*(?:ol[áa]|oi|hello|hi|hey)\s*[!,.…]*\s*[🙂😊👋🤝👍🤗🥳✨]*\s*-?\s*"
+    return re.sub(pattern, "", text, count=1).lstrip()
 
 # ------------------ Endpoints básicos ------------------
 @app.get("/")
@@ -248,15 +265,20 @@ async def correct_english(message: Message):
 
     # ------------------ Correção de frases ------------------
     lang = safe_detect_lang(user_text_raw)
+
     if lang == "en" and user_text_raw.strip().lower().startswith("how"):
         base = (
             "You are a friendly English teacher. The student's English level is {level}.\n"
-            "Correct the student's sentence (if needed), explain briefly, and motivate with one emoji."
+            "Correct the student's sentence (if needed) and explain briefly.\n"
+            "Add one motivating emoji at the END.\n"
+            "Do NOT start the answer with greetings like 'Hello', 'Hi', 'Hey' or similar."
         )
     else:
         base = (
             "Você é um professor amigável de inglês. O aluno está no nível {level}.\n"
-            "Corrija a frase (se necessário), explique em português com uma dica e motive com um emoji."
+            "Corrija a frase (se necessário) e explique em português com uma dica.\n"
+            "Adicione um emoji motivacional no FINAL da resposta.\n"
+            "NÃO comece com saudações como 'Olá', 'Oi' ou similares."
         )
     prompt = base.format(level=message.level)
 
@@ -265,6 +287,10 @@ async def correct_english(message: Message):
     full_prompt = f"{prompt}\n{history_text}\nStudent: '{user_text_raw}'\nAnswer:"
 
     reply_text = model_generate_text(full_prompt)
+
+    # Limpezas pós-Gemini
+    reply_text = strip_motivacao_label(reply_text)   # remove "Motivação:"/"Motivation:"
+    reply_text = strip_greeting_prefix(reply_text)   # remove "Olá/Hello/Hi..." no começo
 
     # Atualiza histórico leve
     memory.setdefault("history", []).extend([
