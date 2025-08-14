@@ -18,7 +18,7 @@ if GEMINI_API_KEY:
 else:
     GEMINI_MODEL_NAME = ""  # sem chave -> modo offline
 
-app = FastAPI(title="English WhatsApp Bot", version="0.6.0")
+app = FastAPI(title="English WhatsApp Bot", version="0.7.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -26,7 +26,7 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"],
 )
 
-# Memória volátil simples (reinicia a cada deploy)
+# ------------------ Estado do app ------------------
 user_memory = {}
 last_quota_error_at = 0.0
 USER_COOLDOWN_SECONDS = 6
@@ -44,7 +44,7 @@ class WhatsAppMessage(BaseModel):
     from_number: str
     body: str
 
-# ------------------ Helpers ------------------
+# ------------------ Utils ------------------
 def safe_detect_lang(text: str) -> str:
     try:
         return detect(text)
@@ -87,7 +87,7 @@ def is_all_english(text: str) -> bool:
         return False
     return True
 
-# --------- Intent detection ----------
+# ------------------ Intents ------------------
 PT_QUESTION_WORDS = {
     "o que","oq","qual","quais","como","quando","onde","por que","porque","por quê",
     "pra que","para que","diferença","significa","pode me ajudar","me explica",
@@ -108,13 +108,33 @@ SMALLTALK_WORDS_EN = {
     "good evening","hi","hello","hey","see ya","bye","goodbye","see you"
 }
 
+def ask_to_explain_sentence_pt(t: str) -> bool:
+    """PT: pede para explicar/traduzir uma frase específica."""
+    t = t.lower()
+    triggers = ["não entendi essa frase", "nao entendi essa frase",
+                "pode me explicar", "me explica em português",
+                "o que quer dizer", "o que significa", "tradu", "explica em portugues"]
+    return any(x in t for x in triggers)
+
+def ask_to_explain_sentence_en(t: str) -> bool:
+    t = t.lower()
+    triggers = ["explain this sentence", "what does it mean", "can you explain this",
+                "translate this", "what does * mean"]
+    return any(x in t for x in triggers)
+
 def classify_intent(text: str, lang: str) -> str:
     t = text.strip().lower()
 
-    # pedido explícito de reexplicar em português
+    # pedido explícito de "explicar em PT" o que foi dito antes
     if any(p in t for p in ["explica em português","explicar em português","em portugues","em português"]) \
        and any(w in t for w in ["pode","por favor","explica","explicar"]):
-        return "explain_pt"
+        return "explain_pt_previous"
+
+    # explicar/traduzir frase específica
+    if lang.startswith("pt") and ask_to_explain_sentence_pt(t):
+        return "explain_sentence"
+    if not lang.startswith("pt") and ask_to_explain_sentence_en(t):
+        return "explain_sentence"
 
     if "?" in t:
         return "question"
@@ -128,39 +148,57 @@ def classify_intent(text: str, lang: str) -> str:
         return "smalltalk"
     return "correction"
 
-# --------- Extrair frase alvo para correção ----------
+# ------------------ Extrair frase alvo (para correção/explicação) ------------------
 QUOTED_RE = re.compile(r'["“”\'‘’\u201c\u201d](.+?)["“”\'‘’\u201c\u201d]', re.DOTALL)
+
+def looks_english(s: str) -> bool:
+    s = s.strip()
+    if not s:
+        return False
+    lang = safe_detect_lang(s)
+    if lang == "en":
+        return True
+    # heurística leve: muitas letras ASCII + espaços
+    letters = sum(ch.isalpha() for ch in s)
+    ascii_letters = sum(ch.isascii() and ch.isalpha() for ch in s)
+    return ascii_letters >= letters * 0.8 and letters >= 3
 
 def extract_target_sentence(user_text: str) -> str | None:
     t = user_text.strip()
 
     # 1) Entre aspas
     m = QUOTED_RE.search(t)
-    if m:
+    if m and looks_english(m.group(1)):
         return m.group(1).strip()
 
-    # 2) Múltiplas linhas: usa a última linha como frase
+    # 2) Última linha se for inglês
     lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
-    if len(lines) >= 2:
-        cand = lines[-1]
-        if len(cand.split()) >= 2:
-            return cand
+    if lines:
+        last = lines[-1]
+        if looks_english(last):
+            return last
 
-    # 3) Após marcador “essa frase está correta?” / “is this sentence correct?”
+    # 3) Depois de marcadores
     lower = t.lower()
     markers = [
         "essa frase está correta", "essa frase esta correta",
         "está correto", "esta correto",
-        "is this sentence correct", "please correct"
+        "is this sentence correct", "please correct",
+        "não entendi essa frase", "nao entendi essa frase",
+        "explain this sentence", "what does it mean"
     ]
     for mk in markers:
         if mk in lower:
-            after = t[lower.find(mk)+len(mk):].strip(" :.-\n")
-            if after:
+            after = t[lower.find(mk)+len(mk):].strip(" :.-\n\t")
+            # pega trecho entre aspas nesse pedaço
+            m2 = QUOTED_RE.search(after)
+            if m2 and looks_english(m2.group(1)):
+                return m2.group(1).strip()
+            if looks_english(after):
                 return after
     return None
 
-# --------- FAQ local ----------
+# ------------------ FAQ local (economiza cota) ------------------
 def local_faq_response(text: str, lang: str):
     t = text.lower().strip()
 
@@ -169,152 +207,38 @@ def local_faq_response(text: str, lang: str):
 
     if (re.search(r"\bmake\b", t) and re.search(r"\bdo\b", t)) and ("diferen" in t or "difference" in t):
         return pick(
-            "Diferença *make x do*: use *make* para criar/produzir algo (*make a cake*), "
-            "e *do* para tarefas/atividades gerais (*do homework*). 👉 Pratique: *I make breakfast, and I do the dishes.*",
-            "Difference *make vs do*: use *make* to create/produce something (*make a cake*), "
-            "and *do* for general tasks/activities (*do homework*). 👉 Practice: *I make breakfast, and I do the dishes.*",
+            "Diferença *make x do*: use *make* para criar/produzir algo (*make a cake*) e *do* para tarefas gerais (*do homework*). 👉 *I make breakfast, and I do the dishes.*",
+            "Difference *make vs do*: use *make* to create/produce (*make a cake*) and *do* for general tasks (*do homework*). 👉 *I make breakfast, and I do the dishes.*",
         )
     if "used to" in t or "use to" in t or ("significa" in t and "used to" in t):
         return pick(
-            "*used to* fala de hábitos/situações do passado que não são mais verdadeiros: "
-            "*I used to play soccer.* 👉 Pratique: *I used to ______ every weekend.*",
-            "*used to* refers to past habits/situations that are no longer true: "
-            "*I used to play soccer.* 👉 Practice: *I used to ______ every weekend.*",
+            "*used to* = hábito no passado que não é mais verdade. 👉 *I used to play soccer.*",
+            "*used to* = past habit no longer true. 👉 *I used to play soccer.*",
         )
     if ("since" in t and "for" in t) or ("desde" in t and "por" in t):
         return pick(
-            "*since* + ponto no tempo: *since 2019*; *for* + duração: *for two years*. "
-            "👉 Pratique: *I have lived here since 2019 / for two years.*",
-            "*since* + starting point: *since 2019*; *for* + duration: *for two years*. "
-            "👉 Practice: *I have lived here since 2019 / for two years.*",
-        )
-    if re.search(r"\b(a|an|the)\b", t) and any(w in t for w in ["usar","use","article","artigo"]):
-        return pick(
-            "*a* (som de consoante), *an* (som de vogal); *the* quando é específico/conhecido. "
-            "👉 Pratique: *I saw a cat. The cat was cute.*",
-            "*a* before consonant sound, *an* before vowel sound; *the* when specific/known. "
-            "👉 Practice: *I saw a cat. The cat was cute.*",
-        )
-    if ("much" in t and "many" in t) or ("muito" in t and "muitos" in t):
-        return pick(
-            "*many* + contáveis (*many books*); *much* + incontáveis (*much water*). "
-            "👉 Pratique: *How many friends do you have? / How much time do we have?*",
-            "*many* with countables (*many books*); *much* with uncountables (*much water*). "
-            "👉 Practice: *How many friends do you have? / How much time do we have?*",
-        )
-    if re.search(r"\b(in|on|at)\b", t) and any(w in t for w in ["time","tempo","quando","when"]):
-        return pick(
-            "*in* (meses/anos), *on* (dias/datas), *at* (horas). "
-            "👉 Pratique: *The class is on Tuesday at 8 am in May.*",
-            "*in* (months/years), *on* (days/dates), *at* (times). "
-            "👉 Practice: *The class is on Tuesday at 8 am in May.*",
-        )
-    if any(w in t for w in ["comparative","superlative","comparativo","superlativo"]):
-        return pick(
-            "Curtos: *-er/-est* (tall → taller/tallest). Longos: *more/most* (interesting → more/most interesting). "
-            "👉 Pratique: *This book is more interesting than that one.*",
-            "Short: *-er/-est* (tall → taller/tallest). Long: *more/most* (interesting → more/most interesting). "
-            "👉 Practice: *This book is more interesting than that one.*",
-        )
-    if "present perfect" in t or ("have" in t and "past" in t) or "pretérito perfeito" in t:
-        return pick(
-            "*Present perfect* = experiência/resultado até agora (*I have seen it*). "
-            "*Simple past* = momento terminado no passado (*I saw it yesterday*). "
-            "👉 Pratique: *I have visited London, but I visited Paris last year.*",
-            "*Present perfect* = experience/result up to now (*I have seen it*). "
-            "*Simple past* = finished time in the past (*I saw it yesterday*). "
-            "👉 Practice: *I have visited London, but I visited Paris last year.*",
+            "*since* + ponto no tempo; *for* + duração. 👉 *I have lived here since 2019 / for two years.*",
+            "*since* + starting point; *for* + duration. 👉 *I have lived here since 2019 / for two years.*",
         )
     return None
 
-# --------- Smalltalk ----------
+# ------------------ Smalltalk ------------------
 RESP_PT = {
-    "bom_dia": [
-        "☀️ *Good morning!* Bora começar o dia com 1 frase em inglês? Me manda que eu corrijo.",
-        "Bom dia! 🌞 Que tal praticar? Escreva *uma* frase curta em inglês e eu te ajudo.",
-        "Good morning! ✨ Se quiser, já te passo um mini desafio. É só dizer *#desafio*."
-    ],
-    "boa_tarde": [
-        "🌤️ *Good afternoon!* Me manda uma frase em inglês e eu te retorno com correção e dica.",
-        "Boa tarde! Vamos praticar rapidinho? Uma frase em inglês e eu explico o porquê. 😉",
-    ],
-    "boa_noite": [
-        "🌙 *Good evening!* Topa uma última prática do dia? Envie uma frase em inglês.",
-        "Boa noite! 😴 Antes de encerrar, manda *uma* frase que eu corrijo em 1 min.",
-    ],
-    "saudacao": [
-        "Hey! 👋 Vamos praticar? Mande uma frase em inglês que eu corrijo com *explicação e dica*.",
-        "Olá! 🙌 Se quiser, pergunte algo de gramática que eu explico com exemplos.",
-        "Hi! 🙂 Eu também faço *quiz* se você mandar *#quiz*."
-    ],
-    "tudo_bem": [
-        "Tudo certo por aqui! 😄 E aí, bora praticar uma frase em inglês?",
-        "Tudo bem! 💪 Qual dúvida de inglês você quer tirar hoje?",
-    ],
-    "agradecimento": [
-        "Tamo junto! 🙏 Quando quiser, manda outra frase.",
-        "De nada! 😊 Quer tentar um *mini desafio*? Envie *#desafio*.",
-    ],
-    "despedida": [
-        "Até mais! 👋 Se quiser revisar depois, é só me chamar.",
-        "See you! 👀 Volta quando quiser praticar mais.",
-    ],
     "default": [
         "👍 Bora praticar! Envie uma frase em inglês para eu corrigir ou faça uma pergunta de gramática.",
         "🚀 Partiu inglês! Manda uma frase ou dúvida que eu te ajudo.",
     ],
 }
 RESP_EN = {
-    "good_morning": [
-        "☀️ Good morning! Send me one sentence to correct today.",
-        "Morning! 🌞 I can give you a quick tip if you send a sentence."
-    ],
-    "good_afternoon": [
-        "🌤️ Good afternoon! Ready for a quick practice?",
-        "Hey! Send me a sentence and I'll correct it with a short tip. 😉"
-    ],
-    "good_evening": [
-        "🌙 Good evening! One last practice before bed?",
-        "Evening! Send one sentence and I’ll fix it up."
-    ],
-    "greeting": [
-        "Hi! 👋 Send a sentence to correct or ask a grammar question.",
-        "Hello! 🙌 I can also run a quick *#quiz* for you."
-    ],
-    "thanks": [
-        "You're welcome! 🙏 Got another sentence?",
-        "Anytime! 😊 Want a *mini challenge*? Send *#desafio*."
-    ],
-    "bye": [
-        "See you! 👋 Come back anytime to practice.",
-        "Bye! 👀 I'll be here when you need me."
-    ],
     "default": [
-        "👍 Let’s practice! Send me an English sentence to correct or ask a grammar question.",
-        "🚀 Ready when you are—one sentence or any question."
+        "👍 Let’s practice! Send me one sentence to correct or ask a grammar question.",
+        "🚀 Ready when you are—one sentence or any question.",
     ],
 }
 def smalltalk_reply(text: str, lang: str) -> str:
-    t = text.lower()
-    if lang.startswith("pt"):
-        if "bom dia" in t: return random.choice(RESP_PT["bom_dia"])
-        if "boa tarde" in t: return random.choice(RESP_PT["boa_tarde"])
-        if "boa noite" in t: return random.choice(RESP_PT["boa_noite"])
-        if any(s in t for s in ["tudo bem","tudo bom"]): return random.choice(RESP_PT["tudo_bem"])
-        if any(s in t for s in ["obrigado","valeu","brigado"]): return random.choice(RESP_PT["agradecimento"])
-        if any(s in t for s in ["tchau","falou","até mais","ate mais"]): return random.choice(RESP_PT["despedida"])
-        if any(s in t for s in ["oi","olá","ola","salve","eai","e aí","e ai"]): return random.choice(RESP_PT["saudacao"])
-        return random.choice(RESP_PT["default"])
-    else:
-        if "good morning" in t or "morning" in t: return random.choice(RESP_EN["good_morning"])
-        if "good afternoon" in t: return random.choice(RESP_EN["good_afternoon"])
-        if "good night" in t or "good evening" in t or "evening" in t: return random.choice(RESP_EN["good_evening"])
-        if any(s in t for s in ["thanks","thank you","thx"]): return random.choice(RESP_EN["thanks"])
-        if any(s in t for s in ["bye","goodbye","see ya","see you"]): return random.choice(RESP_EN["bye"])
-        if any(s in t for s in ["hello","hi","hey"]): return random.choice(RESP_EN["greeting"])
-        return random.choice(RESP_EN["default"])
+    return random.choice(RESP_PT["default"] if lang.startswith("pt") else RESP_EN["default"])
 
-# ------------------ Endpoints básicos ------------------
+# ------------------ Endpoints ------------------
 @app.get("/")
 def root():
     return {"message": "OLÁ, MUNDO!", "service": "English WhatsApp Bot"}
@@ -323,7 +247,6 @@ def root():
 def health():
     return {"status": "ok"}
 
-# ------------------ Endpoint principal ------------------
 @app.post("/correct")
 async def correct_english(message: Message):
     global last_quota_error_at
@@ -339,27 +262,25 @@ async def correct_english(message: Message):
     def can_call_ai() -> bool:
         return (now - last_call) >= USER_COOLDOWN_SECONDS and (now - last_quota_error_at) >= 30
 
-    # comando utilitário
     if user_text.lower() == "#resetar":
         user_memory.pop(message.phone, None)
-        return {"reply": "🔄 Sua memória foi resetada com sucesso! Pode recomeçar."}
+        return {"reply": "🔄 Sua memória foi resetada. Podemos recomeçar!"}
 
-    # intenção
     lang = safe_detect_lang(user_text_raw)
     intent = classify_intent(user_text_raw, lang)
 
-    # (0) reexplicar em português o que foi dito antes
-    if intent == "explain_pt":
+    # (A) Reexplicar em PT a última resposta
+    if intent == "explain_pt_previous":
         last_ai = memory.get("last_ai_reply", "")
         if not last_ai:
-            return {"reply": "Não encontrei a última explicação. Envie a frase ou pergunta novamente. 🙂"}
+            return {"reply": "Não achei a última explicação. Me diga o que você quer que eu explique. 🙂"}
         if not can_call_ai():
             return {"reply": QUOTA_FRIENDLY_REPLY_PT}
         prompt = (
-            "Explique em PORTUGUÊS (Brasil), de forma simples, o conteúdo abaixo, "
-            "como se você estivesse esclarecendo para um aluno iniciante. "
-            "Não cumprimente. Seja direto. Use exemplos curtos.\n\n"
-            f"--- CONTEÚDO ---\n{last_ai}\n--- FIM ---\n\nExplicação em português:"
+            "Explique em PORTUGUÊS (Brasil) de forma *CURTA e objetiva* (máx. 5 linhas), "
+            "como se estivesse esclarecendo para um aluno iniciante. "
+            "Sem saudação. Use frases curtas. Se útil, dê 1 exemplo simples.\n\n"
+            f"--- CONTEÚDO ---\n{last_ai}\n--- FIM ---\n\nExplicação curta:"
         )
         text = model_generate_text(prompt)
         if is_quota_error_text(text):
@@ -370,57 +291,76 @@ async def correct_english(message: Message):
         memory["last_call_ts"] = now
         return {"reply": text}
 
-    # (1) pergunta → FAQ local primeiro
+    # (B) Pedir para explicar/traduzir UMA FRASE (PT ou EN)
+    if intent == "explain_sentence":
+        target = extract_target_sentence(user_text_raw)
+        if not target:
+            # fallback: se não achou, pede para mandar a frase
+            return {"reply": "Me envie a *frase em inglês* que você quer que eu explique (de preferência entre aspas)."}
+        if not can_call_ai():
+            return {"reply": QUOTA_FRIENDLY_REPLY_PT}
+
+        # sempre responde em PT (você está ensinando brasileiros)
+        prompt = (
+            "Explique a *frase em inglês* abaixo em **PORTUGUÊS do Brasil**, de forma *curta e direta* (até 5 linhas):\n"
+            "1) Tradução simples em 1 linha.\n"
+            "2) 2–4 vocabulários chave (formato: Palavra → significa ...).\n"
+            "3) Se houver ponto gramatical relevante, cite em 1 linha.\n"
+            "4) Se fizer sentido, sugira 1 versão alternativa mais natural (1 linha).\n"
+            "Não cumprimente. Sem parágrafos longos.\n\n"
+            f"Frase: \"{target}\"\n\nResposta:"
+        )
+        text = model_generate_text(prompt)
+        if is_quota_error_text(text):
+            last_quota_error_at = time.time()
+            return {"reply": QUOTA_FRIENDLY_REPLY_PT}
+        text = strip_greeting_prefix(strip_motivacao_label(text))
+        memory["last_ai_reply"] = text
+        memory["last_call_ts"] = now
+        return {"reply": text}
+
+    # (C) Perguntas gerais → FAQ local, depois IA curta
     if intent == "question":
         local = local_faq_response(user_text_raw, lang)
         if local:
             memory["last_ai_reply"] = local
             return {"reply": local}
+        if not can_call_ai():
+            return {"reply": QUOTA_FRIENDLY_REPLY_PT if not is_all_english(user_text_raw) else QUOTA_FRIENDLY_REPLY_EN}
 
         if is_all_english(user_text_raw):
-            if not can_call_ai():
-                return {"reply": QUOTA_FRIENDLY_REPLY_EN}
             base = (
                 "You are an English teacher. Answer ONLY in ENGLISH.\n"
-                "Explain clearly what the student asked, with short examples when useful.\n"
-                "Do NOT greet. Do NOT correct the student's question. Focus on the topic.\n"
-                "Finish with one single practice sentence (one line)."
+                "Be short and clear (max 5 lines). No greetings. Give 1 short example if useful."
             )
             prompt = f"{base}\n\nStudent question:\n\"{user_text_raw}\"\n\nAnswer:"
             text = model_generate_text(prompt)
             if is_quota_error_text(text):
                 last_quota_error_at = time.time()
                 return {"reply": QUOTA_FRIENDLY_REPLY_EN}
-            text = strip_greeting_prefix(strip_motivacao_label(text))
-            memory["last_ai_reply"] = text
-            memory["last_call_ts"] = now
-            return {"reply": text}
         else:
-            if not can_call_ai():
-                return {"reply": QUOTA_FRIENDLY_REPLY_PT}
             base = (
-                "Você é um professor de inglês. Responda em português (Brasil).\n"
-                "Explique de forma clara e prática o que o aluno perguntou, com exemplos curtos em inglês quando útil.\n"
-                "NÃO cumprimente. NÃO corrija a pergunta do aluno. Foque na explicação do tema.\n"
-                "No final, sugira 1 frase de exemplo para o aluno praticar (somente 1 linha)."
+                "Você é um professor de inglês. Responda em PT-BR *de forma curta* (máx. 5 linhas). "
+                "Sem saudação. Dê 1 exemplo curto em inglês, se útil. Não corrija a pergunta do aluno."
             )
             prompt = f"{base}\n\nPergunta do aluno:\n\"{user_text_raw}\"\n\nResposta:"
             text = model_generate_text(prompt)
             if is_quota_error_text(text):
                 last_quota_error_at = time.time()
                 return {"reply": QUOTA_FRIENDLY_REPLY_PT}
-            text = strip_greeting_prefix(strip_motivacao_label(text))
-            memory["last_ai_reply"] = text
-            memory["last_call_ts"] = now
-            return {"reply": text}
 
-    # (2) smalltalk → offline
+        text = strip_greeting_prefix(strip_motivacao_label(text))
+        memory["last_ai_reply"] = text
+        memory["last_call_ts"] = now
+        return {"reply": text}
+
+    # (D) Smalltalk → offline
     if intent == "smalltalk":
         rep = smalltalk_reply(user_text_raw, lang)
         memory["last_ai_reply"] = rep
         return {"reply": rep}
 
-    # (3) correção → extrai frase alvo; PT responde em PT, EN responde em EN
+    # (E) Correção (frase alvo), PT explica em PT; EN explica em EN — sempre conciso
     target = extract_target_sentence(user_text_raw) or user_text_raw
     if not can_call_ai():
         return {"reply": QUOTA_FRIENDLY_REPLY_PT if not is_all_english(user_text_raw) else QUOTA_FRIENDLY_REPLY_EN}
@@ -428,16 +368,16 @@ async def correct_english(message: Message):
     if is_all_english(user_text_raw):
         base = (
             "You are a friendly English teacher. The student's English level is {level}.\n"
-            "Answer in ENGLISH only. Do NOT greet. Do NOT translate to Portuguese.\n"
+            "Answer in ENGLISH only. No greeting. Keep it concise (3 lines + emojis allowed).\n"
             "Return EXACTLY these sections, each on its own line:\n"
             "*Correction:* <corrected sentence in English>\n"
-            "*Explanation:* <short explanation in English of the grammar or usage>\n"
+            "*Explanation:* <short explanation in English>\n"
             "*Tip:* <one short tip in English, end with a single emoji>"
         )
     else:
         base = (
             "Você é um professor amigável de inglês. O aluno está no nível {level}.\n"
-            "Responda em PORTUGUÊS (Brasil). NÃO cumprimente. NÃO traduza a frase corrigida para o português.\n"
+            "Responda em PT-BR. Sem saudação. Seja *curto e direto* (3–5 linhas no total).\n"
             "Devolva EXATAMENTE estes blocos, cada um em sua própria linha:\n"
             "*Correção:* <frase corrigida em inglês>\n"
             "*Explicação:* <explicação curta em português sobre a regra aplicada>\n"
