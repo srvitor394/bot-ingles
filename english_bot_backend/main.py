@@ -18,7 +18,7 @@ if GEMINI_API_KEY:
 else:
     GEMINI_MODEL_NAME = ""  # sem chave -> modo offline
 
-app = FastAPI(title="English WhatsApp Bot", version="0.5.0")
+app = FastAPI(title="English WhatsApp Bot", version="0.6.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -28,8 +28,8 @@ app.add_middleware(
 
 # Memória volátil simples (reinicia a cada deploy)
 user_memory = {}
-last_quota_error_at = 0.0  # epoch da última 429 global
-USER_COOLDOWN_SECONDS = 6   # throttle de IA por usuário
+last_quota_error_at = 0.0
+USER_COOLDOWN_SECONDS = 6
 
 # ------------------ Schemas ------------------
 class Message(BaseModel):
@@ -61,7 +61,6 @@ QUOTA_FRIENDLY_REPLY_PT = "⚠️ Bati no limite gratuito diário da IA por agor
 QUOTA_FRIENDLY_REPLY_EN = "⚠️ I just hit today’s free AI quota. Please try again later. 🙏"
 
 def model_generate_text(prompt: str) -> str:
-    """Chama Gemini; retorna string legível (mesmo em erro)."""
     if not GEMINI_API_KEY or not GEMINI_MODEL_NAME:
         return "⚠️ (modo offline) GEMINI_API_KEY ausente."
     try:
@@ -80,15 +79,25 @@ def strip_greeting_prefix(text: str) -> str:
     pattern = r"(?im)^\s*(?:ol[áa]|oi|hello|hi|hey)\s*[!,.…]*\s*[🙂😊👋🤝👍🤗🥳✨]*\s*-?\s*"
     return re.sub(pattern, "", text, count=1).lstrip()
 
+def is_all_english(text: str) -> bool:
+    lang = safe_detect_lang(text)
+    if lang != "en":
+        return False
+    if any(w in text.lower() for w in ["portugu", "tradu", "em pt", "em português", "em portugues"]):
+        return False
+    return True
+
 # --------- Intent detection ----------
 PT_QUESTION_WORDS = {
     "o que","oq","qual","quais","como","quando","onde","por que","porque","por quê",
     "pra que","para que","diferença","significa","pode me ajudar","me explica",
-    "é correto","esta certo","está certo","está errado","devo usar","exemplo de","como usar"
+    "é correto","esta certo","está certo","está errado","devo usar","exemplo de","como usar",
+    "essa frase está correta","pode corrigir","corrigir","corrige","ver se está certo"
 }
 EN_QUESTION_WORDS = {
     "what","which","how","when","where","why","difference","mean","meaning",
-    "should i","is it correct","am i","can i","could i","what's","whats","example of","how to use"
+    "should i","is it correct","am i","can i","could i","what's","whats","example of","how to use",
+    "is this sentence correct","please correct"
 }
 SMALLTALK_WORDS_PT = {
     "obrigado","valeu","blz","beleza","tmj","ok","boa","bom dia","boa tarde","boa noite",
@@ -101,24 +110,63 @@ SMALLTALK_WORDS_EN = {
 
 def classify_intent(text: str, lang: str) -> str:
     t = text.strip().lower()
-    if "?" in t: return "question"
+
+    # pedido explícito de reexplicar em português
+    if any(p in t for p in ["explica em português","explicar em português","em portugues","em português"]) \
+       and any(w in t for w in ["pode","por favor","explica","explicar"]):
+        return "explain_pt"
+
+    if "?" in t:
+        return "question"
     if lang.startswith("pt"):
         if any(w in t for w in PT_QUESTION_WORDS): return "question"
         if any(w in t for w in SMALLTALK_WORDS_PT): return "smalltalk"
     else:
         if any(w in t for w in EN_QUESTION_WORDS): return "question"
         if any(w in t for w in SMALLTALK_WORDS_EN): return "smalltalk"
-    if len(t.split()) <= 2: return "smalltalk"  # “ok”, “beleza”, etc.
+    if len(t.split()) <= 2:
+        return "smalltalk"
     return "correction"
 
-# --------- FAQ local (regex -> resposta) ----------
+# --------- Extrair frase alvo para correção ----------
+QUOTED_RE = re.compile(r'["“”\'‘’\u201c\u201d](.+?)["“”\'‘’\u201c\u201d]', re.DOTALL)
+
+def extract_target_sentence(user_text: str) -> str | None:
+    t = user_text.strip()
+
+    # 1) Entre aspas
+    m = QUOTED_RE.search(t)
+    if m:
+        return m.group(1).strip()
+
+    # 2) Múltiplas linhas: usa a última linha como frase
+    lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
+    if len(lines) >= 2:
+        cand = lines[-1]
+        if len(cand.split()) >= 2:
+            return cand
+
+    # 3) Após marcador “essa frase está correta?” / “is this sentence correct?”
+    lower = t.lower()
+    markers = [
+        "essa frase está correta", "essa frase esta correta",
+        "está correto", "esta correto",
+        "is this sentence correct", "please correct"
+    ]
+    for mk in markers:
+        if mk in lower:
+            after = t[lower.find(mk)+len(mk):].strip(" :.-\n")
+            if after:
+                return after
+    return None
+
+# --------- FAQ local ----------
 def local_faq_response(text: str, lang: str):
     t = text.lower().strip()
 
     def pick(pt, en):
         return pt if lang.startswith("pt") else en
 
-    # make vs do
     if (re.search(r"\bmake\b", t) and re.search(r"\bdo\b", t)) and ("diferen" in t or "difference" in t):
         return pick(
             "Diferença *make x do*: use *make* para criar/produzir algo (*make a cake*), "
@@ -126,8 +174,6 @@ def local_faq_response(text: str, lang: str):
             "Difference *make vs do*: use *make* to create/produce something (*make a cake*), "
             "and *do* for general tasks/activities (*do homework*). 👉 Practice: *I make breakfast, and I do the dishes.*",
         )
-
-    # used to
     if "used to" in t or "use to" in t or ("significa" in t and "used to" in t):
         return pick(
             "*used to* fala de hábitos/situações do passado que não são mais verdadeiros: "
@@ -135,17 +181,13 @@ def local_faq_response(text: str, lang: str):
             "*used to* refers to past habits/situations that are no longer true: "
             "*I used to play soccer.* 👉 Practice: *I used to ______ every weekend.*",
         )
-
-    # since vs for
     if ("since" in t and "for" in t) or ("desde" in t and "por" in t):
         return pick(
-            "*since* + ponto no tempo (desde quando): *since 2019*; *for* + duração: *for two years*. "
+            "*since* + ponto no tempo: *since 2019*; *for* + duração: *for two years*. "
             "👉 Pratique: *I have lived here since 2019 / for two years.*",
             "*since* + starting point: *since 2019*; *for* + duration: *for two years*. "
             "👉 Practice: *I have lived here since 2019 / for two years.*",
         )
-
-    # a / an / the
     if re.search(r"\b(a|an|the)\b", t) and any(w in t for w in ["usar","use","article","artigo"]):
         return pick(
             "*a* (som de consoante), *an* (som de vogal); *the* quando é específico/conhecido. "
@@ -153,8 +195,6 @@ def local_faq_response(text: str, lang: str):
             "*a* before consonant sound, *an* before vowel sound; *the* when specific/known. "
             "👉 Practice: *I saw a cat. The cat was cute.*",
         )
-
-    # much vs many
     if ("much" in t and "many" in t) or ("muito" in t and "muitos" in t):
         return pick(
             "*many* + contáveis (*many books*); *much* + incontáveis (*much water*). "
@@ -162,8 +202,6 @@ def local_faq_response(text: str, lang: str):
             "*many* with countables (*many books*); *much* with uncountables (*much water*). "
             "👉 Practice: *How many friends do you have? / How much time do we have?*",
         )
-
-    # in / on / at (tempo)
     if re.search(r"\b(in|on|at)\b", t) and any(w in t for w in ["time","tempo","quando","when"]):
         return pick(
             "*in* (meses/anos), *on* (dias/datas), *at* (horas). "
@@ -171,8 +209,6 @@ def local_faq_response(text: str, lang: str):
             "*in* (months/years), *on* (days/dates), *at* (times). "
             "👉 Practice: *The class is on Tuesday at 8 am in May.*",
         )
-
-    # comparatives / superlatives
     if any(w in t for w in ["comparative","superlative","comparativo","superlativo"]):
         return pick(
             "Curtos: *-er/-est* (tall → taller/tallest). Longos: *more/most* (interesting → more/most interesting). "
@@ -180,8 +216,6 @@ def local_faq_response(text: str, lang: str):
             "Short: *-er/-est* (tall → taller/tallest). Long: *more/most* (interesting → more/most interesting). "
             "👉 Practice: *This book is more interesting than that one.*",
         )
-
-    # present perfect vs simple past
     if "present perfect" in t or ("have" in t and "past" in t) or "pretérito perfeito" in t:
         return pick(
             "*Present perfect* = experiência/resultado até agora (*I have seen it*). "
@@ -191,10 +225,9 @@ def local_faq_response(text: str, lang: str):
             "*Simple past* = finished time in the past (*I saw it yesterday*). "
             "👉 Practice: *I have visited London, but I visited Paris last year.*",
         )
-
     return None
 
-# --------- Smalltalk (variado e temático) ----------
+# --------- Smalltalk ----------
 RESP_PT = {
     "bom_dia": [
         "☀️ *Good morning!* Bora começar o dia com 1 frase em inglês? Me manda que eu corrijo.",
@@ -231,7 +264,6 @@ RESP_PT = {
         "🚀 Partiu inglês! Manda uma frase ou dúvida que eu te ajudo.",
     ],
 }
-
 RESP_EN = {
     "good_morning": [
         "☀️ Good morning! Send me one sentence to correct today.",
@@ -262,10 +294,8 @@ RESP_EN = {
         "🚀 Ready when you are—one sentence or any question."
     ],
 }
-
 def smalltalk_reply(text: str, lang: str) -> str:
     t = text.lower()
-
     if lang.startswith("pt"):
         if "bom dia" in t: return random.choice(RESP_PT["bom_dia"])
         if "boa tarde" in t: return random.choice(RESP_PT["boa_tarde"])
@@ -305,89 +335,124 @@ async def correct_english(message: Message):
     memory = user_memory.setdefault(message.phone, {})
     now = time.time()
 
-    # Throttle por usuário para chamadas de IA
     last_call = memory.get("last_call_ts", 0.0)
     def can_call_ai() -> bool:
         return (now - last_call) >= USER_COOLDOWN_SECONDS and (now - last_quota_error_at) >= 30
 
-    # ------------------ Estados (quiz/desafio) omitidos por foco em smalltalk/faq  ------------------
-    cmd = user_text.lower()
-    if cmd == "#resetar":
+    # comando utilitário
+    if user_text.lower() == "#resetar":
         user_memory.pop(message.phone, None)
         return {"reply": "🔄 Sua memória foi resetada com sucesso! Pode recomeçar."}
 
-    # ------------------ Detecção de intenção ------------------
+    # intenção
     lang = safe_detect_lang(user_text_raw)
     intent = classify_intent(user_text_raw, lang)
 
-    # 1) Pergunta -> tenta FAQ local primeiro (grátis)
+    # (0) reexplicar em português o que foi dito antes
+    if intent == "explain_pt":
+        last_ai = memory.get("last_ai_reply", "")
+        if not last_ai:
+            return {"reply": "Não encontrei a última explicação. Envie a frase ou pergunta novamente. 🙂"}
+        if not can_call_ai():
+            return {"reply": QUOTA_FRIENDLY_REPLY_PT}
+        prompt = (
+            "Explique em PORTUGUÊS (Brasil), de forma simples, o conteúdo abaixo, "
+            "como se você estivesse esclarecendo para um aluno iniciante. "
+            "Não cumprimente. Seja direto. Use exemplos curtos.\n\n"
+            f"--- CONTEÚDO ---\n{last_ai}\n--- FIM ---\n\nExplicação em português:"
+        )
+        text = model_generate_text(prompt)
+        if is_quota_error_text(text):
+            last_quota_error_at = time.time()
+            return {"reply": QUOTA_FRIENDLY_REPLY_PT}
+        text = strip_greeting_prefix(strip_motivacao_label(text))
+        memory["last_ai_reply"] = text
+        memory["last_call_ts"] = now
+        return {"reply": text}
+
+    # (1) pergunta → FAQ local primeiro
     if intent == "question":
         local = local_faq_response(user_text_raw, lang)
         if local:
+            memory["last_ai_reply"] = local
             return {"reply": local}
-        if not can_call_ai():
-            return {"reply": QUOTA_FRIENDLY_REPLY_PT if lang.startswith('pt') else QUOTA_FRIENDLY_REPLY_EN}
 
-        if lang.startswith("pt"):
+        if is_all_english(user_text_raw):
+            if not can_call_ai():
+                return {"reply": QUOTA_FRIENDLY_REPLY_EN}
             base = (
-                "Você é um professor de inglês. Responda em português (Brasil).\n"
-                "Explique de forma clara e prática o que o aluno perguntou, com exemplos curtos em inglês quando útil.\n"
-                "NÃO cumprimente. NÃO corrija a pergunta do aluno. Foque na explicação do tema.\n"
-                "Se houver termos em inglês, mantenha-os em *itálico*.\n"
-                "No final, sugira 1 frase de exemplo para o aluno praticar (somente 1 linha)."
-            )
-        else:
-            base = (
-                "You are an English teacher. Answer in ENGLISH.\n"
+                "You are an English teacher. Answer ONLY in ENGLISH.\n"
                 "Explain clearly what the student asked, with short examples when useful.\n"
                 "Do NOT greet. Do NOT correct the student's question. Focus on the topic.\n"
                 "Finish with one single practice sentence (one line)."
             )
-        prompt = f"{base}\n\nStudent question:\n\"{user_text_raw}\"\n\nAnswer:"
-        text = model_generate_text(prompt)
-        if is_quota_error_text(text):
-            last_quota_error_at = time.time()
-            return {"reply": QUOTA_FRIENDLY_REPLY_PT if lang.startswith('pt') else QUOTA_FRIENDLY_REPLY_EN}
-        text = strip_greeting_prefix(strip_motivacao_label(text))
-        memory["last_call_ts"] = now
-        return {"reply": text}
+            prompt = f"{base}\n\nStudent question:\n\"{user_text_raw}\"\n\nAnswer:"
+            text = model_generate_text(prompt)
+            if is_quota_error_text(text):
+                last_quota_error_at = time.time()
+                return {"reply": QUOTA_FRIENDLY_REPLY_EN}
+            text = strip_greeting_prefix(strip_motivacao_label(text))
+            memory["last_ai_reply"] = text
+            memory["last_call_ts"] = now
+            return {"reply": text}
+        else:
+            if not can_call_ai():
+                return {"reply": QUOTA_FRIENDLY_REPLY_PT}
+            base = (
+                "Você é um professor de inglês. Responda em português (Brasil).\n"
+                "Explique de forma clara e prática o que o aluno perguntou, com exemplos curtos em inglês quando útil.\n"
+                "NÃO cumprimente. NÃO corrija a pergunta do aluno. Foque na explicação do tema.\n"
+                "No final, sugira 1 frase de exemplo para o aluno praticar (somente 1 linha)."
+            )
+            prompt = f"{base}\n\nPergunta do aluno:\n\"{user_text_raw}\"\n\nResposta:"
+            text = model_generate_text(prompt)
+            if is_quota_error_text(text):
+                last_quota_error_at = time.time()
+                return {"reply": QUOTA_FRIENDLY_REPLY_PT}
+            text = strip_greeting_prefix(strip_motivacao_label(text))
+            memory["last_ai_reply"] = text
+            memory["last_call_ts"] = now
+            return {"reply": text}
 
-    # 2) Smalltalk (variado e sempre offline)
+    # (2) smalltalk → offline
     if intent == "smalltalk":
-        return {"reply": smalltalk_reply(user_text_raw, lang)}
+        rep = smalltalk_reply(user_text_raw, lang)
+        memory["last_ai_reply"] = rep
+        return {"reply": rep}
 
-    # 3) Correção (IA quando permitido)
+    # (3) correção → extrai frase alvo; PT responde em PT, EN responde em EN
+    target = extract_target_sentence(user_text_raw) or user_text_raw
     if not can_call_ai():
-        return {"reply": QUOTA_FRIENDLY_REPLY_PT if lang.startswith('pt') else QUOTA_FRIENDLY_REPLY_EN}
+        return {"reply": QUOTA_FRIENDLY_REPLY_PT if not is_all_english(user_text_raw) else QUOTA_FRIENDLY_REPLY_EN}
 
-    if lang == "en" and user_text_raw.strip().lower().startswith("how"):
+    if is_all_english(user_text_raw):
         base = (
             "You are a friendly English teacher. The student's English level is {level}.\n"
-            "Answer in ENGLISH only. Do NOT greet. Do NOT translate the student's sentence.\n"
-            "Return EXACTLY these sections, in this order, each on its own line:\n"
+            "Answer in ENGLISH only. Do NOT greet. Do NOT translate to Portuguese.\n"
+            "Return EXACTLY these sections, each on its own line:\n"
             "*Correction:* <corrected sentence in English>\n"
             "*Explanation:* <short explanation in English of the grammar or usage>\n"
-            "*Tip:* <one short tip in English, end with a single emoji>\n"
-            "No extra text before or after the sections."
+            "*Tip:* <one short tip in English, end with a single emoji>"
         )
     else:
         base = (
             "Você é um professor amigável de inglês. O aluno está no nível {level}.\n"
             "Responda em PORTUGUÊS (Brasil). NÃO cumprimente. NÃO traduza a frase corrigida para o português.\n"
-            "Devolva EXATAMENTE estes blocos, nesta ordem, cada um em sua própria linha:\n"
+            "Devolva EXATAMENTE estes blocos, cada um em sua própria linha:\n"
             "*Correção:* <frase corrigida em inglês>\n"
             "*Explicação:* <explicação curta em português sobre a regra aplicada>\n"
-            "*Dica:* <uma dica curta em português, finalize com um único emoji>\n"
-            "Não inclua nada além desses blocos."
+            "*Dica:* <uma dica curta em português, finalize com um único emoji>"
         )
 
     prompt = base.format(level=message.level)
-    full_prompt = f"{prompt}\n\nStudent: '{user_text_raw}'\nAnswer:"
+    full_prompt = f"{prompt}\n\nFrase do aluno para corrigir:\n\"{target}\"\n\nResposta:"
     reply_text = model_generate_text(full_prompt)
     if is_quota_error_text(reply_text):
         last_quota_error_at = time.time()
-        return {"reply": QUOTA_FRIENDLY_REPLY_PT if lang.startswith('pt') else QUOTA_FRIENDLY_REPLY_EN}
+        return {"reply": QUOTA_FRIENDLY_REPLY_PT if not is_all_english(user_text_raw) else QUOTA_FRIENDLY_REPLY_EN}
     reply_text = strip_greeting_prefix(strip_motivacao_label(reply_text))
+
+    memory["last_ai_reply"] = reply_text
     memory["last_call_ts"] = now
     return {"reply": reply_text}
 
