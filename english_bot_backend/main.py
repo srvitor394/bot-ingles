@@ -7,7 +7,6 @@ from langdetect import detect, LangDetectException
 import google.generativeai as genai
 import os, re, time, random, unicodedata, json
 
-# ... (todo o cabeçalho e configurações permanecem iguais) ...
 # ===================== CONFIG =====================
 load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
@@ -102,7 +101,6 @@ def looks_english(s: str) -> bool:
     return ascii_letters >= letters * 0.8
 
 def extract_english_sentence(user_text: str) -> str | None:
-    # ... (função sem alterações) ...
     m = QUOTED_RE.search(user_text)
     if m and looks_english(m.group(1)):
         return m.group(1).strip()
@@ -121,16 +119,14 @@ def extract_english_sentence(user_text: str) -> str | None:
     return None
 
 # ===================== INTENTS (CLASSIFICADOR) =====================
-# <<< MUDANÇA: Separamos "greeting" de "chit_chat" para tratamento especial.
 INTENT_KEYWORDS = {
     "greeting": ["bom dia", "boa tarde", "boa noite", "oi", "ola", "hello", "hi", "hey", "good morning", "good afternoon", "good evening"],
     "chit_chat": ["obrigado", "valeu", "ok", "blz", "beleza", "thanks", "thank you", "cool", "nice"],
-    "correction": ["corrigir", "corrige", "esta correto", "is this correct", "please correct"],
+    "correction": ["corrigir", "corrige", "esta correto", "is this correct", "please correct", "essa frase esta correta"],
     "explain_sentence": ["nao entendi", "explica", "significa", "quer dizer", "what does it mean", "explain this"],
     "question": ["o que", "qual", "como", "quando", "diferença", "what", "how", "why", "difference"],
 }
 
-# <<< MUDANÇA: A lista de tópicos agora fica junto com as outras keywords para consistência.
 TOPIC_KEYWORDS = {
     "verbo to be": ["verbo to be", "to be", "am is are"],
     "simple past": ["simple past", "passado simples", "did", "ed verbs"],
@@ -144,8 +140,6 @@ TOPIC_KEYWORDS = {
 def classify_intent_by_rules(user_text: str) -> tuple[str | None, str | None]:
     t_norm = _unaccent(user_text.lower()).strip()
 
-    # <<< MUDANÇA: Verificação de saudação vem PRIMEIRO. É a mais importante.
-    # Usamos `==` para evitar que uma frase longa que contenha "bom dia" seja classificada como saudação.
     if t_norm in INTENT_KEYWORDS["greeting"]:
         return "greeting", t_norm
 
@@ -165,6 +159,10 @@ def classify_intent_by_rules(user_text: str) -> tuple[str | None, str | None]:
         if any(kw in t_norm for kw in INTENT_KEYWORDS["explain_sentence"]):
             return "explain_sentence", eng_sentence
         return "correction", eng_sentence
+    
+    # Adicionado para pegar casos como "Essa frase está correta? She go to school"
+    if any(kw in t_norm for kw in INTENT_KEYWORDS["correction"]):
+        return "correction", user_text
 
     if "?" in t_norm or any(kw in t_norm for kw in INTENT_KEYWORDS["question"]):
         return "question", user_text
@@ -172,19 +170,31 @@ def classify_intent_by_rules(user_text: str) -> tuple[str | None, str | None]:
     if looks_english(user_text):
         return "correction", user_text
 
-    # <<< MUDANÇA: Renomeado de "smalltalk" para "chit_chat"
     if any(kw in t_norm for kw in INTENT_KEYWORDS["chit_chat"]):
         return "chit_chat", None
 
     return None, None
 
-# ... (Conteúdo local LESSONS_PT permanece o mesmo) ...
+# ===================== CONTEÚDO LOCAL (AULAS) =====================
 LESSONS_PT = {
-    "verbo to be": "...", "simple past": "...", "present continuous": "...",
-    "articles": "...", "make vs do": "...", "since vs for": "..."
+    "verbo to be": (
+        "🧩 *Verbo To Be (am/is/are)*\n"
+        "• Uso: identidade, estado, localização. \n"
+        "• Estruturas: I *am* / You *are* / He/She/It *is* / We/They *are*.\n"
+        "• Negativa: I *am not*, He *isn't*, They *aren't*.\n"
+        "• Pergunta: *Are* you ok?  *Is* she home?\n"
+        "Ex.: *I am a student.* / *She is happy.* / *They are in Brazil.*\n"
+    ),
+    "simple past": (
+        "⏳ *Simple Past (passado simples)*\n"
+        "• Ações terminadas no passado. \n"
+        "• Regulares: verbo + *-ed* (play → played). Irregulares: go → went, have → had.\n"
+        "• Negativa: did + not + verbo base (I *didn't go*). Pergunta: *Did* you go?\n"
+        "Ex.: *She watched a movie yesterday.* / *I went to school.*\n"
+    ),
 }
+
 # ===================== RESPOSTAS NATURAIS =====================
-# <<< MUDANÇA: Nova função para responder saudações de forma natural.
 def greeting_reply(greeting_text: str) -> str:
     greeting_text = _unaccent(greeting_text.lower())
     if "bom dia" in greeting_text:
@@ -195,9 +205,8 @@ def greeting_reply(greeting_text: str) -> str:
         return "Boa noite! Espero que tenha tido um ótimo dia. 🌙"
     if any(s in greeting_text for s in ["oi", "ola", "hello", "hi", "hey"]):
         return random.choice(["Olá! 👋", "Oi, tudo bem?", "Hello! How can I help you today?"])
-    return "Olá! 😊" # Fallback
+    return "Olá! 😊"
 
-# <<< MUDANÇA: Função para o resto do smalltalk (agora chit_chat).
 def chit_chat_reply(lang: str) -> str:
     if lang.startswith("pt"):
         return random.choice([
@@ -208,9 +217,8 @@ def chit_chat_reply(lang: str) -> str:
     else:
         return random.choice(["You're welcome!", "Sure thing!", "Anytime! Let me know if you need anything else."])
 
-# ===================== PROMPTS REFINADOS =====================
+# ===================== PROMPTS COMPLETOS =====================
 
-# <<< MUDANÇA: Adicionamos uma regra explícita no roteador para saudações.
 def prompt_router_ai(user_message: str) -> str:
     return (
         "Você é um assistente que classifica a intenção de um aluno de inglês. Responda APENAS com um objeto JSON.\n"
@@ -221,13 +229,66 @@ def prompt_router_ai(user_message: str) -> str:
         "```json\n"
     )
 
-# ... (Todos os outros prompts: prompt_question_pt, prompt_correction_pt, etc., permanecem os mesmos) ...
-def prompt_question_pt(question: str): return "..."
-def prompt_question_en(question: str): return "..."
-def prompt_correction_pt(level: str, sentence: str): return "..."
-def prompt_correction_en(level: str, sentence: str): return "..."
-def prompt_explain_sentence_pt(sentence: str): return "..."
-def prompt_reexplain_pt(text_to_explain: str): return "..."
+# <<< MUDANÇA: CORPO DAS FUNÇÕES DE PROMPT RESTAURADO
+def prompt_question_pt(question: str) -> str:
+    return (
+        "Você é um professor de inglês didático. Responda em PT-BR.\n"
+        "Explique o tópico gramatical da pergunta de forma clara e estruturada. Use bullet points.\n"
+        "A estrutura da resposta deve ser:\n"
+        "1. **O que é**: Explicação simples (1-2 linhas).\n"
+        "2. **Como usar**: Exemplos de afirmativa, negativa e pergunta.\n"
+        "3. **Exemplos Práticos**: 2 frases de exemplo com tradução.\n"
+        "Seja conciso. Sem saudação.\n\n"
+        f"Dúvida do aluno: \"{question}\"\n\nResposta:"
+    )
+
+def prompt_question_en(question: str) -> str:
+    return (
+        "You are an English teacher. Answer in ENGLISH, clearly and briefly (max 5 lines). "
+        "Give 1 short example if helpful. No greetings.\n\n"
+        f"Student question: \"{question}\"\n\nAnswer:"
+    )
+
+def prompt_correction_pt(level: str, sentence: str) -> str:
+    return (
+        "Você é um professor amigável de inglês. Responda em PT-BR, curto e direto. "
+        "Comece com uma nota positiva antes dos blocos (Ex: 'Boa tentativa!').\n"
+        "Não cumprimente. Não traduza a frase corrigida.\n"
+        "Devolva EXATAMENTE estes blocos, cada um em sua própria linha:\n"
+        "*Correção:* <frase corrigida em inglês>\n"
+        "*Explicação:* <regra/razão em português (1–2 linhas)>\n"
+        "*Dica:* <uma dica curta em português, finalize com um emoji>\n\n"
+        f"Nível do aluno: {level}\n"
+        f"Frase do aluno: \"{sentence}\"\n\nResposta:"
+    )
+
+def prompt_correction_en(level: str, sentence: str) -> str:
+    return (
+        "You are a friendly English teacher. Answer in ENGLISH only. Be concise (3–5 lines). No greeting.\n"
+        "Return EXACTLY these sections, each on its own line:\n"
+        "*Correction:* <corrected sentence>\n"
+        "*Explanation:* <short reason/rule>\n"
+        "*Tip:* <one short tip, end with a single emoji>\n\n"
+        f"Student level: {level}\n"
+        f"Student sentence: \"{sentence}\"\n\nAnswer:"
+    )
+
+def prompt_explain_sentence_pt(sentence: str) -> str:
+    return (
+        "Explique a *frase em inglês* abaixo em **PT-BR**, de forma *curta e clara* (até 5 linhas):\n"
+        "1) Tradução simples.\n"
+        "2) 2–4 vocabulários chave (Palavra → significado).\n"
+        "3) 1 ponto gramatical, se houver.\n"
+        "Sem saudação.\n\n"
+        f"Frase: \"{sentence}\"\n\nResposta:"
+    )
+
+def prompt_reexplain_pt(text_to_explain: str) -> str:
+    return (
+        "Reexplica em PT-BR, *curto e objetivo* (até 5 linhas), como se fosse para um iniciante. "
+        "Sem saudação. Use 1 exemplo simples.\n\n"
+        f"Conteúdo a reexplicar:\n{text_to_explain}\n\nReexplicação curta:"
+    )
 
 # ===================== ENDPOINTS BÁSICOS =====================
 @app.get("/")
@@ -270,7 +331,6 @@ async def correct_english(message: Message):
     use_ai = False
     prompt = ""
 
-    # <<< MUDANÇA: Bloco de `if` agora trata `greeting` e `chit_chat` separadamente.
     if intent == "reset":
         user_memory.pop(phone, None)
         reply = "🔄 Memória resetada. Bora recomeçar!"
@@ -290,7 +350,7 @@ async def correct_english(message: Message):
             prompt = prompt_reexplain_pt(last_ai)
             
     elif intent == "topic_lesson":
-        if content in LESSONS_PT:
+        if content and content in LESSONS_PT:
             reply = LESSONS_PT[content]
         else:
             use_ai = True
@@ -306,10 +366,11 @@ async def correct_english(message: Message):
 
     elif intent == "correction":
         use_ai = True
-        sentence_to_correct = content or user_text
+        # <<< MUDANÇA: Garante que a frase a ser corrigida seja extraída corretamente.
+        sentence_to_correct = extract_english_sentence(user_text) or (content if looks_english(content) else user_text)
         prompt = prompt_correction_pt(message.level, sentence_to_correct) if not lang_msg.startswith("en") else prompt_correction_en(message.level, sentence_to_correct)
 
-    else: # Fallback genérico, caso a IA retorne uma intenção desconhecida
+    else:
         use_ai = True
         prompt = prompt_question_pt(user_text)
 
@@ -324,7 +385,7 @@ async def correct_english(message: Message):
         else:
             reply = strip_headers(text)
 
-    # --- 4. ATUALIZAR MEMÓria E RETORNAR ---
+    # --- 4. ATUALIZAR MEMÓRIA E RETORNAR ---
     if reply:
         memory["last_ai_reply"] = reply
         if use_ai:
@@ -332,7 +393,7 @@ async def correct_english(message: Message):
             
     return {"reply": reply or "Não entendi sua mensagem, pode tentar de outra forma?"}
 
-# ... (Utilidades /resetar e /whatsapp/webhook permanecem iguais) ...
+# ===================== UTILIDADES =====================
 @app.post("/resetar")
 async def resetar_memoria(req: ResetReq):
     user_memory.pop(req.phone, None)
